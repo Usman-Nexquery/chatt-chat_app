@@ -1,173 +1,142 @@
 import json
 from channels.generic.websocket import AsyncWebsocketConsumer
-from apps.users.models import User  # Import your custom User model
-from apps.chat.models import Message, ChatRoom
-from apps.core.authentication import CustomAuthBackend
-import jwt  # Assuming you're using PyJWT for decoding tokens
-from config import settings
+from .models import ChatRoom, Message
 from channels.db import database_sync_to_async
+import jwt  # Assuming you're using PyJWT for decoding tokens
+from django.conf import settings  # Ensure you're using Django settings for the secret key
+
+from ..users.models import User
 
 
 class ChatConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        # Extract the `authorization` header
+        # Extract the chat_room_id from URL route
+        self.chat_room_id = self.scope["url_route"]["kwargs"]["chat_room_id"]
+        self.chat_group_name = f"chat_{self.chat_room_id}"
+
+        # Retrieve or create the chat room (async-safe query)
+        self.chat_room = await self.get_chat_room(self.chat_room_id)
+
+        if not self.chat_room:
+            # Close connection if chat room does not exist
+            await self.close()
+            return
+
+        # Extract the JWT token from the Authorization header
         headers = dict(self.scope["headers"])
         auth_header = headers.get(b"authorization", b"").decode("utf-8")
-
-        # Extract token from the header
         token = auth_header.split(" ")[-1] if " " in auth_header else auth_header
 
-        # Check if token exists
-        if not token:
-            await self.close()
-            return
+        # Authenticate the user using the JWT token
+        user = await self.authenticate_user_from_token(token)
+        print("my email is", user)
+        print(user.is_authenticated)
 
-        # Decode the JWT token and get the user email
-        user_email = await self.decode_token_and_get_email(token)
-        if not user_email:
-            await self.close()
-            return
+        if user and user.is_authenticated:
+            # Add the user to the chat room if not already part of the room
+            await self.add_user_to_chat_room(user)
 
-        # Authenticate the user using the email
-        user = await self.get_user_from_email(user_email)
-        if not user:
-            await self.close()
-            return
+            # Add the authenticated user to the scope so we can use it in other methods
+            self.scope['user'] = user
 
-        # Attach the authenticated user to the scope
-        self.scope['user'] = user
-
-        # Get or create the chat room with the users
-        user_ids = self.scope['user'].id
-        chat_room = await self.get_or_create_chat_room([user_ids])  # you can modify this line to accept multiple users
-
-        if chat_room:
-            self.chat_room = chat_room  # Assign chat room to the instance
-
-            # Add user to the group for broadcasting messages
+            # Join the chat group
             await self.channel_layer.group_add(
-                str(chat_room.id),  # The group name is the chat room id
-                self.channel_name
+                self.chat_group_name,
+                self.channel_name,
             )
 
             # Accept the WebSocket connection
             await self.accept()
         else:
+            # If authentication fails, close the connection
             await self.close()
 
     async def disconnect(self, close_code):
-        # Leave the chat room group
-        if hasattr(self, 'chat_room'):
+        # Retrieve the user from the WebSocket scope
+        user = self.scope.get('user')
+
+        if user and user.is_authenticated:
+            # Remove the user from the chat room and leave the chat group
+            await self.remove_user_from_chat_room(user)
+
             await self.channel_layer.group_discard(
-                str(self.chat_room.id),  # The group name is the chat room id
-                self.channel_name
+                self.chat_group_name,
+                self.channel_name,
             )
 
     async def receive(self, text_data):
-        # Parse received data
         text_data_json = json.loads(text_data)
-        message = text_data_json.get("message", None)
-        user_ids = text_data_json.get("user_ids", None)
+        message_content = text_data_json["message"]
 
-        if user_ids and message:
-            # Ensure the sender is in the list of user IDs
-            if self.scope['user'].id not in user_ids:
-                user_ids.append(self.scope['user'].id)
+        # Retrieve the user from the WebSocket scope
+        user = self.scope.get('user')
 
-            # Get or create the chat room
-            chat_room = await self.get_or_create_chat_room(user_ids)
-            if chat_room:
-                # Save the message
-                await self.save_message(chat_room, message)
+        # Create a new message in the database with the timestamp (async-safe)
+        message = await self.create_message(user, message_content)
 
-                # Fetch all messages from the chat room
-                messages = await self.get_messages_from_room(chat_room)
-
-                # Broadcast the message to all connected users in the chat room
-                await self.channel_layer.group_send(
-                    str(chat_room.id),  # The group name is the chat room id
-                    {
-                        "type": "chat_message",  # Custom message type to handle in `chat_message`
-                        "messages": messages
-                    }
-                )
-            else:
-                await self.close()
-        else:
-            await self.close()
+        # Broadcast the message to the chat group, including the timestamp
+        await self.channel_layer.group_send(
+            self.chat_group_name,
+            {
+                "type": "chat_message",
+                "message": message.content,
+                "timestamp": message.timestamp.isoformat()  # Include timestamp in ISO format
+            },
+        )
 
     async def chat_message(self, event):
-        # Send the message to the WebSocket
+        message = event["message"]
+        timestamp = event["timestamp"]
+
+        # Send the message to WebSocket
         await self.send(text_data=json.dumps({
-            "messages": event["messages"]
+            "message": message,
+            "timestamp": timestamp
         }))
 
-    async def decode_token_and_get_email(self, token):
+    # Async-safe database methods
+
+    @database_sync_to_async
+    def get_chat_room(self, chat_room_id):
         try:
-            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=['HS256'])
-            user = await self.get_user_from_id(payload.get("user_id"))
-            return user.email if user else None
+            return ChatRoom.objects.get(id=chat_room_id)
+        except ChatRoom.DoesNotExist:
+            return None
+
+    @database_sync_to_async
+    def add_user_to_chat_room(self, user):
+        self.chat_room.users.add(user)
+
+    @database_sync_to_async
+    def remove_user_from_chat_room(self, user):
+        self.chat_room.users.remove(user)
+
+    @database_sync_to_async
+    def create_message(self, user, message_content):
+        # Ensure that 'user' is a fully loaded User instance
+        try:
+            user_instance = User.objects.get(id=user.id)
+        except User.DoesNotExist:
+            print("user does not exist")  # Fetch the actual User instance
+        return Message.objects.create(
+            chatroom=self.chat_room,
+            sender=user_instance,  # Use the fully loaded User instance
+            content=message_content
+        )
+
+    @database_sync_to_async
+    def authenticate_user_from_token(self, token):
+        try:
+            # Decode the JWT token to extract user information
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+            user_id = payload.get("user_id")
+
+            # Retrieve the user based on the user_id from the payload
+            if user_id:
+                user = User.objects.get(id=user_id)
+                return user  # Ensure it's a proper User object
+            else:
+                return None
         except (jwt.ExpiredSignatureError, jwt.InvalidTokenError) as e:
             print(f"Token error: {e}")
-            return None
-
-    @database_sync_to_async
-    def get_user_from_email(self, email):
-        try:
-            custom_auth_backend = CustomAuthBackend()
-            return custom_auth_backend.authenticate(email=email)
-        except Exception as e:
-            print(f"Authentication error: {e}")
-            return None
-
-    @database_sync_to_async
-    def get_user_from_id(self, user_id):
-        try:
-            return User.objects.get(id=user_id)
-        except User.DoesNotExist:
-            return None
-
-    @database_sync_to_async
-    def get_or_create_chat_room(self, user_ids):
-        # Sort user IDs to ensure consistent order
-        user_ids = sorted(user_ids)
-
-        # Attempt to find an existing chat room with these users
-        try:
-            chat_rooms = ChatRoom.objects.filter(users__id__in=user_ids).distinct()
-            for chat_room in chat_rooms:
-                if chat_room.users.count() == len(user_ids):
-                    return chat_room
-
-            # Create a new chat room if none exists
-            chat_room = ChatRoom.objects.create(name="Chat Room")
-            chat_room.users.add(*user_ids)
-            return chat_room
-        except Exception as e:
-            print(f"Error in get_or_create_chat_room: {e}")
-            return None
-
-    @database_sync_to_async
-    def get_messages_from_room(self, chat_room):
-        # Fetch all messages from the chat room, ordered by timestamp
-        messages = Message.objects.filter(chatroom=chat_room).order_by('timestamp')
-        return [
-            {
-                "sender": message.sender.username,
-                "content": message.content,
-                "timestamp": message.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            for message in messages
-        ]
-
-    @database_sync_to_async
-    def save_message(self, chat_room, message_text):
-        try:
-            return Message.objects.create(
-                chatroom=chat_room,
-                sender=self.scope['user'],
-                content=message_text,
-            )
-        except Exception as e:
-            print(f"Error saving message: {e}")
             return None
