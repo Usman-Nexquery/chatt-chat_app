@@ -2,37 +2,25 @@ import json
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 from .models import ChatRoom, Message
-from ..users.models import User
-import jwt
-from django.conf import settings
-
 
 class ChatConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        # Authenticate the user
-        headers = dict(self.scope["headers"])
-        auth_header = headers.get(b"authorization", b"").decode("utf-8")
-        token = auth_header.split(" ")[-1] if " " in auth_header else auth_header
+        # Get the user from the scope (already attached by the middleware)
+        self.user = self.scope["user"]
+        print("the user is : ",self.user)
 
-        self.user = await self.authenticate_user_from_token(token)
+        # Get chat rooms the user is part of
+        self.chat_rooms = await self.get_user_chat_rooms(self.user)
 
-        if self.user and self.user.is_authenticated:
-            # Add the authenticated user to the scope
-            self.scope['user'] = self.user
-            # Get chat rooms the user is part of
-            self.chat_rooms = await self.get_user_chat_rooms(self.user)
-            # Add the user to groups for all chat rooms they are a part of
-            for chat_room in self.chat_rooms:
-                await self.channel_layer.group_add(
-                    f"chat_{chat_room.id}",  # Using chat room ID to create a unique group for each chat room
-                    self.channel_name
-                )
+        # Add the user to groups for all chat rooms they are a part of
+        for chat_room in self.chat_rooms:
+            await self.channel_layer.group_add(
+                f"chat_{chat_room.id}",  # Using chat room ID to create a unique group for each chat room
+                self.channel_name
+            )
 
-            # Accept the WebSocket connection
-            await self.accept()
-        else:
-            # Close the connection if authentication fails
-            await self.close()
+        # Accept the WebSocket connection
+        await self.accept()
 
     async def disconnect(self, close_code):
         # Remove the user from all chat room groups
@@ -89,18 +77,3 @@ class ChatConsumer(AsyncWebsocketConsumer):
     @database_sync_to_async
     def create_message(self, user, chat_room, message_content):
         return Message.objects.create(chatroom=chat_room, sender=user, content=message_content)
-
-    @database_sync_to_async
-    def authenticate_user_from_token(self, token):
-        try:
-            # Decode the JWT token
-            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
-            user_id = payload.get("user_id")
-
-            # Retrieve the user
-            if user_id:
-                return User.objects.get(id=user_id)
-            else:
-                return None
-        except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
-            return None
