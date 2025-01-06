@@ -1,154 +1,106 @@
 import json
 from channels.generic.websocket import AsyncWebsocketConsumer
-from apps.users.models import User  # Import your custom User model
-from apps.chat.models import Message, ChatRoom
-from apps.core.authentication import CustomAuthBackend
 from channels.db import database_sync_to_async
-import jwt  # Assuming you're using PyJWT for decoding tokens
-from apps.users.selectors import get_user_from_id  # Import the selector function
-from config import settings
+from .models import ChatRoom, Message
+from ..users.models import User
+import jwt
+from django.conf import settings
 
 
 class ChatConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        # Get the `authorization` header
+        # Authenticate the user
         headers = dict(self.scope["headers"])
         auth_header = headers.get(b"authorization", b"").decode("utf-8")
+        token = auth_header.split(" ")[-1] if " " in auth_header else auth_header
 
-        # Split by whitespace and extract the token
-        if " " in auth_header:
-            token = auth_header.split(" ")[-1]  # Extract the last part after "Bearer" or any prefix
+        self.user = await self.authenticate_user_from_token(token)
+
+        if self.user and self.user.is_authenticated:
+            # Add the authenticated user to the scope
+            self.scope['user'] = self.user
+            # Get chat rooms the user is part of
+            self.chat_rooms = await self.get_user_chat_rooms(self.user)
+            # Add the user to groups for all chat rooms they are a part of
+            for chat_room in self.chat_rooms:
+                await self.channel_layer.group_add(
+                    f"chat_{chat_room.id}",  # Using chat room ID to create a unique group for each chat room
+                    self.channel_name
+                )
+
+            # Accept the WebSocket connection
+            await self.accept()
         else:
-            token = auth_header  # No prefix, assume it's just the token
-
-        print(f"Extracted Token: {token}")
-
-        # Check if token exists
-        if not token:
+            # Close the connection if authentication fails
             await self.close()
-            return
-
-        # Decode the JWT token to get the email
-        user_email = await self.decode_token_and_get_email(token)
-        if not user_email:
-            await self.close()
-            return
-
-        # Now, authenticate the user using the email
-        user = await self.get_user_from_email(user_email)
-        if not user:
-            await self.close()
-            return
-
-        # Attach the authenticated user to the scope
-        self.scope['user'] = user
-
-        # Proceed with WebSocket connection
-        self.room_name = None
-        self.room_group_name = None
-        await self.accept()
 
     async def disconnect(self, close_code):
-        pass
+        # Remove the user from all chat room groups
+        for chat_room in self.chat_rooms:
+            await self.channel_layer.group_discard(
+                f"chat_{chat_room.id}",
+                self.channel_name
+            )
 
     async def receive(self, text_data):
         text_data_json = json.loads(text_data)
-        message = text_data_json.get("message", None)
-        room_id = text_data_json.get("room_id", None)
+        message_content = text_data_json["message"]
+        chat_room_id = text_data_json["chat_room_id"]
 
-        if room_id is not None:
-            self.room_group_name = f"chat_{room_id}"
-            chat_room = await self.get_chat_room(room_id)
-            if chat_room:
-                await self.save_message(chat_room, message)
-                await self.send_chat_message_to_room(message)
-        else:
-            await self.send({
-                'type': 'websocket.close'
-            })
+        # Ensure the user is part of the chat room they are sending a message to
+        chat_room = await self.get_chat_room(chat_room_id)
+        if chat_room and chat_room in self.chat_rooms:
+            # Create a new message in the database
+            message = await self.create_message(self.user, chat_room, message_content)
 
-    async def send_chat_message_to_room(self, message):
-        if self.room_group_name:
+            # Broadcast the message to the chat group
             await self.channel_layer.group_send(
-                self.room_group_name,
+                f"chat_{chat_room.id}",
                 {
                     "type": "chat_message",
-                    "message": message,
-                }
+                    "message": message.content,
+                    "timestamp": message.timestamp.isoformat(),
+                    "chat_room_id": chat_room.id,
+                },
             )
 
     async def chat_message(self, event):
-        message = event["message"]
+        # Send the message to WebSocket
         await self.send(text_data=json.dumps({
-            "message": message
+            "message": event["message"],
+            "timestamp": event["timestamp"],
+            "chat_room_id": event["chat_room_id"],
         }))
 
-    async def decode_token_and_get_email(self, token):
-        """
-        Decodes the JWT token and retrieves the email from it.
-        This method assumes you are using JWT with a payload that includes the email.
-        """
-        try:
-            # Decode the token using your secret key (configured in settings)
-            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=['HS256'])
-            # Now wrap the get_user_from_id in database_sync_to_async
-            user = await self.get_user_from_id(payload.get("user_id"))
-
-            if not user:
-                return None
-
-            user_email = user.email
-            print(f"user email : {user_email}")
-            return user_email
-        except jwt.ExpiredSignatureError:
-            print("Token expired.")
-            return None
-        except jwt.InvalidTokenError:
-            print("Invalid token.")
-            return None
+    # Async-safe database methods
 
     @database_sync_to_async
-    def get_user_from_id(self, user_id):
-        """
-        This function is now wrapped with `database_sync_to_async`
-        to allow it to run in an async context.
-        """
-        try:
-            user = User.objects.get(id=user_id)
-            return user
-        except User.DoesNotExist:
-            return None
+    def get_user_chat_rooms(self, user):
+        # Get all chat rooms the user is a part of
+        return list(user.chatrooms.all())
 
-    async def get_user_from_email(self, email):
-        """
-        Authenticates the user based on the extracted email.
-        This function calls the custom authentication backend to authenticate the user.
-        """
+    @database_sync_to_async
+    def get_chat_room(self, chat_room_id):
         try:
-            # Use your custom authentication backend to get the user
-            custom_auth_backend = CustomAuthBackend()
-            user = custom_auth_backend.authenticate(email=email)
-            return user
-        except Exception as e:
-            print(f"Error in user authentication: {e}")
-            return None
-
-    async def get_chat_room(self, room_id):
-        try:
-            chat_room = await database_sync_to_async(ChatRoom.objects.get)(id=room_id)
-            return chat_room
+            return ChatRoom.objects.get(id=chat_room_id)
         except ChatRoom.DoesNotExist:
             return None
 
-    async def save_message(self, chat_room, message_text):
+    @database_sync_to_async
+    def create_message(self, user, chat_room, message_content):
+        return Message.objects.create(chatroom=chat_room, sender=user, content=message_content)
+
+    @database_sync_to_async
+    def authenticate_user_from_token(self, token):
         try:
-            # Save message in the database
-            message = await database_sync_to_async(Message.objects.create)(
-                chat_room=chat_room,
-                user=self.scope['user'],
-                text=message_text,
-            )
-            return message
-        except Exception as e:
-            print(f"Error saving message: {e}")
+            # Decode the JWT token
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+            user_id = payload.get("user_id")
+
+            # Retrieve the user
+            if user_id:
+                return User.objects.get(id=user_id)
+            else:
+                return None
+        except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
             return None
