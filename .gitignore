@@ -1,1 +1,6 @@
 venv
+venv/
+db.sqlite3
+staticfiles
+staticfiles/
+apps/users/__pycache__/
