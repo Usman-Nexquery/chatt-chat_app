@@ -19,7 +19,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
         # Mark the user as online in Redis
         redis_instance.set(f"online_user_{self.user.id}", "1")
 
-        # Update the status of all 'sent' messages to 'delivered' for this user
+        # Update all 'sent' messages to 'delivered'
         await self.update_sent_messages_to_delivered(self.user)
 
         # Add user to online group for each chat room
@@ -161,19 +161,72 @@ class ChatConsumer(AsyncWebsocketConsumer):
         """
         Message.objects.filter(id__in=message_ids, chatroom__users=user).update(status=Message.SEEN)
 
+    # Refactored Methods
     @database_sync_to_async
-    def update_sent_messages_to_delivered(self, user):
+    def fetch_sent_messages(self, user):
         """
-        Fetch all `sent` messages for the user and update them to `delivered`.
+        Fetch all sent messages for the user that need to be updated to 'delivered'.
         """
-        sent_messages = Message.objects.filter(
-            chatroom__users=user,  # The user is in the chat room
-            status=Message.SENT  # Only SENT messages
-        ).exclude(
-            sender=user  # Exclude messages where the sender is the user
+        return list(
+            Message.objects.filter(
+                chatroom__users=user,  # The user is in the chat room
+                status=Message.SENT    # Only SENT messages
+            ).exclude(
+                sender=user             # Exclude messages where the sender is the user
+            )
         )
 
-        for message in sent_messages:
-            message.status = Message.DELIVERED
-            message.save()
-        return sent_messages
+    async def update_and_notify_messages(self, messages):
+        """
+        Update the status of messages to 'delivered' and notify the sender.
+        """
+        for message in messages:
+            # Update message status
+            await self.update_message_status(message, Message.DELIVERED)
+
+            # Notify the sender
+            await self.send_delivered_notification(message)
+
+    async def update_sent_messages_to_delivered(self, user):
+        """
+        Fetch all sent messages for the user and update their status to 'delivered'.
+        """
+        # Fetch sent messages for the user
+        messages = await self.fetch_sent_messages(user)
+
+        # Update the messages and send notifications
+        await self.update_and_notify_messages(messages)
+
+    @database_sync_to_async
+    def get_chat_room_id(self, message):
+        return message.chatroom.id,message.sender.username
+
+    async def send_delivered_notification(self, message):
+        """
+        Send a notification to the sender that their message has been delivered.
+        """
+        chat_room_id,sender = await self.get_chat_room_id(message)
+
+        await self.channel_layer.group_send(
+            f"chat_{chat_room_id}",  # The group of the chat room
+            {
+                "type": "message_delivered_notification",  # Custom event type
+                "message_id": message.id,
+                "chat_room_id": chat_room_id,
+                "status": message.status,
+                "sender": sender,
+                "timestamp": message.timestamp.isoformat(),
+            },
+        )
+    async def message_delivered_notification(self, event):
+        """
+        Send the delivered notification to the sender.
+        """
+        await self.send(text_data=json.dumps({
+            "type": "message_delivered",
+            "message_id": event["message_id"],
+            "status": event["status"],
+            "sender": event["sender"],
+            "timestamp": event["timestamp"],
+            "chat_room_id": event["chat_room_id"],
+        }))
