@@ -42,36 +42,58 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
     async def receive(self, text_data):
         text_data_json = json.loads(text_data)
-        message_content = text_data_json["message"]
-        chat_room_id = text_data_json["chat_room_id"]
+        event_type = text_data_json.get("type")  # Determine the type of event
+        chat_room_id = text_data_json.get("chat_room_id")
 
-        # Fetch the chat room and ensure the user is part of it
-        chat_room = await self.get_chat_room(chat_room_id)
-        if chat_room and chat_room in self.chat_rooms:
-            # Get the recipient (users in the chat room excluding the sender)
-            recipient = await self.get_chat_room_recipient(chat_room, self.user)
+        if event_type == "send_message":
+            message_content = text_data_json["message"]
 
-            # Create a new message in the database
-            message = await self.create_message(self.user, chat_room, message_content)
+            # Fetch the chat room and ensure the user is part of it
+            chat_room = await self.get_chat_room(chat_room_id)
+            if chat_room and chat_room in self.chat_rooms:
+                # Get the recipient (users in the chat room excluding the sender)
+                recipient = await self.get_chat_room_recipient(chat_room, self.user)
 
-            # Check if the recipient is online using Redis
-            recipient_is_online = await self.is_user_online(recipient)
+                # Create a new message in the database
+                message = await self.create_message(self.user, chat_room, message_content)
 
-            # Update message status to 'delivered' if recipient is online, otherwise leave it as 'sent'
-            new_status = Message.DELIVERED if recipient_is_online else Message.SENT
-            await self.update_message_status(message, new_status)
+                # Check if the recipient is online using Redis
+                recipient_is_online = await self.is_user_online(recipient)
 
-            # Broadcast the message to the chat room group
-            await self.channel_layer.group_send(
-                f"chat_{chat_room.id}",
-                {
-                    "type": "chat_message",
-                    "message": message.content,
-                    "timestamp": message.timestamp.isoformat(),
-                    "chat_room_id": chat_room.id,
-                    "status": new_status,
-                },
-            )
+                # Update message status to 'delivered' if recipient is online, otherwise leave it as 'sent'
+                new_status = Message.DELIVERED if recipient_is_online else Message.SENT
+                await self.update_message_status(message, new_status)
+
+                # Broadcast the message to the chat room group
+                await self.channel_layer.group_send(
+                    f"chat_{chat_room.id}",
+                    {
+                        "type": "chat_message",
+                        "message": message.content,
+                        "timestamp": message.timestamp.isoformat(),
+                        "chat_room_id": chat_room.id,
+                        "status": new_status,
+                    },
+                )
+
+        elif event_type == "mark_seen":
+            # Handle marking messages as seen
+            message_ids = text_data_json.get("message_ids", [])
+
+            # Update the status of the specified messages to 'seen'
+            if message_ids:
+                await self.mark_messages_as_seen(message_ids, self.user)
+
+                # Notify other participants in the chat room that messages were seen
+                await self.channel_layer.group_send(
+                    f"chat_{chat_room_id}",
+                    {
+                        "type": "messages_seen",
+                        "message_ids": message_ids,
+                        "chat_room_id": chat_room_id,
+                        "seen_by": self.user.username,
+                    },
+                )
 
     async def chat_message(self, event):
         # Send the message to WebSocket
@@ -80,6 +102,15 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "timestamp": event["timestamp"],
             "chat_room_id": event["chat_room_id"],
             "status": event["status"],
+        }))
+
+    async def messages_seen(self, event):
+        # Notify WebSocket clients that messages were marked as seen
+        await self.send(text_data=json.dumps({
+            "type": "mark_seen",
+            "message_ids": event["message_ids"],
+            "chat_room_id": event["chat_room_id"],
+            "seen_by": event["seen_by"],
         }))
 
     # Async-safe database methods
@@ -119,3 +150,10 @@ class ChatConsumer(AsyncWebsocketConsumer):
         # Generate the Redis key for the user's online status
         user_online_key = f"online_user_{user.id}"
         return redis_instance.exists(user_online_key) == 1
+
+    @database_sync_to_async
+    def mark_messages_as_seen(self, message_ids, user):
+        """
+        Mark messages as 'seen' for the given user.
+        """
+        Message.objects.filter(id__in=message_ids, chatroom__users=user).update(status=Message.SEEN)
