@@ -3,4 +3,7 @@ venv/
 db.sqlite3
 staticfiles
 staticfiles/
+config/__pycache__/
+apps/__pycache__/
+apps/chat/__pycache__/
 apps/users/__pycache__/

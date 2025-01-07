@@ -57,19 +57,27 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     },
                 )
 
+
         elif event_type == "mark_seen":
             message_ids = text_data_json.get("message_ids", [])
             if message_ids:
+                # Mark the messages as seen
                 await self.mark_messages_as_seen(message_ids, self.user)
-                await self.channel_layer.group_send(
-                    f"chat_{chat_room_id}",
-                    {
-                        "type": "messages_seen",
-                        "message_ids": message_ids,
-                        "chat_room_id": chat_room_id,
-                        "seen_by": self.user.username,
-                    },
-                )
+                # Find the sender of the message and send the acknowledgment to their channel
+                for message_id in message_ids:
+                    message = await self.get_message(message_id)
+                    chatroom_id, sender_id = await self.get_sender_and_chatroom_id(message)
+                    sender_channel_name = user_channel_map.get(sender_id)
+                    if sender_channel_name:
+                        await self.channel_layer.send(
+                            sender_channel_name,
+                            {
+                                "type": "messages_seen",
+                                "message_ids": message_id,
+                                "chat_room_id": chatroom_id,
+                                "seen_by": self.user.username,
+                            },
+                        )
 
     async def chat_message(self, event):
         await self.send(text_data=json.dumps({
@@ -86,6 +94,13 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "chat_room_id": event["chat_room_id"],
             "seen_by": event["seen_by"],
         }))
+
+    @database_sync_to_async
+    def get_message(self, id):
+        try:
+            return Message.objects.get(id=id)
+        except Message.DoesNotExist:
+            return None
 
     @database_sync_to_async
     def get_user_chat_rooms(self, user):
@@ -149,11 +164,11 @@ class ChatConsumer(AsyncWebsocketConsumer):
         return message
 
     @database_sync_to_async
-    def get_chat_room_id(self, message):
-        return message.chatroom.id, message.sender.username
+    def get_sender_and_chatroom_id(self, message):
+        return message.chatroom.id, message.sender.id
 
     async def send_delivered_notification(self, message):
-        chatroom_id, sender = await self.get_chat_room_id(message)
+        chatroom_id, sender_id = await self.get_sender_and_chatroom_id(message)
         sender_channel_name = user_channel_map.get(message.sender.id)
 
         if sender_channel_name:
@@ -163,7 +178,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     "type": "message_delivered_notification",
                     "message_id": message.id,
                     "status": message.status,
-                    "sender": sender,
+                    "sender": sender_id,
                     "timestamp": message.timestamp.isoformat(),
                     "chat_room_id": chatroom_id,
                 },
