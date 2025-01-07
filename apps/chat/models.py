@@ -10,10 +10,24 @@ class ChatRoom(models.Model):
         return self.name or f"ChatRoom-{self.id}"
 
 class Message(models.Model):
+    SENT = 'sent'
+    DELIVERED = 'delivered'
+    SEEN = 'seen'
+    STATUS_CHOICES = [
+        (SENT, 'Sent'),
+        (DELIVERED, 'Delivered'),
+        (SEEN, 'Seen'),
+    ]
+
     chatroom = models.ForeignKey(ChatRoom, related_name='messages', on_delete=models.CASCADE)
     sender = models.ForeignKey(User, on_delete=models.CASCADE)
     content = models.TextField()
-    timestamp = models.DateTimeField(auto_now_add=True)  # Automatically set on creation
+    timestamp = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(
+        max_length=10,
+        choices=STATUS_CHOICES,
+        default=SENT,
+    )
 
     def __str__(self):
-        return f"Message from {self.sender} at {self.timestamp}"
+        return f"Message from {self.sender} at {self.timestamp} ({self.status})"
