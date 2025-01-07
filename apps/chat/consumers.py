@@ -19,6 +19,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
         # Mark the user as online in Redis
         redis_instance.set(f"online_user_{self.user.id}", "1")
 
+        # Update the status of all 'sent' messages to 'delivered' for this user
+        await self.update_sent_messages_to_delivered(self.user)
+
         # Add user to online group for each chat room
         for chat_room in self.chat_rooms:
             await self.channel_layer.group_add(
@@ -157,3 +160,20 @@ class ChatConsumer(AsyncWebsocketConsumer):
         Mark messages as 'seen' for the given user.
         """
         Message.objects.filter(id__in=message_ids, chatroom__users=user).update(status=Message.SEEN)
+
+    @database_sync_to_async
+    def update_sent_messages_to_delivered(self, user):
+        """
+        Fetch all `sent` messages for the user and update them to `delivered`.
+        """
+        sent_messages = Message.objects.filter(
+            chatroom__users=user,  # The user is in the chat room
+            status=Message.SENT  # Only SENT messages
+        ).exclude(
+            sender=user  # Exclude messages where the sender is the user
+        )
+
+        for message in sent_messages:
+            message.status = Message.DELIVERED
+            message.save()
+        return sent_messages
