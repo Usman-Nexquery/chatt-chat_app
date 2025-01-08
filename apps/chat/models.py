@@ -5,6 +5,7 @@ class ChatRoom(models.Model):
     id = models.CharField(max_length=255, primary_key=True)  # New id logic based on user IDs
     name = models.CharField(max_length=255, blank=True)  # Optional name field
     users = models.ManyToManyField(User, related_name='chatrooms')
+    is_group = models.BooleanField(default=False)
 
     def __str__(self):
         return self.name or f"ChatRoom-{self.id}"
@@ -28,6 +29,8 @@ class Message(models.Model):
         choices=STATUS_CHOICES,
         default=SENT,
     )
+    delivered_to = models.ManyToManyField(User, related_name='delivered_messages', blank=True)
+    seen_by = models.ManyToManyField(User, related_name='seen_messages', blank=True)
 
     def __str__(self):
         return f"Message from {self.sender} at {self.timestamp} ({self.status})"
