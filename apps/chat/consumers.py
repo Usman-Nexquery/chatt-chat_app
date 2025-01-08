@@ -6,8 +6,8 @@ from config import settings
 import redis
 
 redis_instance = redis.StrictRedis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=0)
-
 user_channel_map = {}
+
 class ChatConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         self.user = self.scope["user"]
@@ -41,29 +41,14 @@ class ChatConsumer(AsyncWebsocketConsumer):
             message_content = text_data_json["message"]
             chat_room = await self.get_chat_room(chat_room_id)
             if chat_room and chat_room in self.chat_rooms:
-                recipient = await self.get_chat_room_recipient(chat_room, self.user)
                 message = await self.create_message(self.user, chat_room, message_content)
-                recipient_is_online = await self.is_user_online(recipient)
-                new_status = Message.DELIVERED if recipient_is_online else Message.SENT
-                await self.update_message_status(message, new_status)
-                await self.channel_layer.group_send(
-                    f"chat_{chat_room.id}",
-                    {
-                        "type": "chat_message",
-                        "message": message.content,
-                        "timestamp": message.timestamp.isoformat(),
-                        "chat_room_id": chat_room.id,
-                        "status": new_status,
-                    },
-                )
-
+                # Notify all users in the chat room
+                await self.notify_chat_room_users(chat_room, message)
 
         elif event_type == "mark_seen":
             message_ids = text_data_json.get("message_ids", [])
             if message_ids:
-                # Mark the messages as seen
                 await self.mark_messages_as_seen(message_ids, self.user)
-                # Find the sender of the message and send the acknowledgment to their channel
                 for message_id in message_ids:
                     message = await self.get_message(message_id)
                     chatroom_id, sender_id = await self.get_sender_and_chatroom_id(message)
@@ -114,11 +99,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
             return None
 
     @database_sync_to_async
-    def get_chat_room_recipient(self, chat_room, sender):
-        users = chat_room.users.exclude(id=sender.id)
-        return users.first() if users.exists() else None
-
-    @database_sync_to_async
     def create_message(self, user, chat_room, message_content):
         return Message.objects.create(chatroom=chat_room, sender=user, content=message_content)
 
@@ -129,14 +109,22 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def mark_messages_as_seen(self, message_ids, user):
-        Message.objects.filter(id__in=message_ids, chatroom__users=user).update(status=Message.SEEN)
+        for message_id in message_ids:
+            try:
+                message = Message.objects.get(id=message_id, chatroom__users=user)
+                message.delivered_to.add(user)
+                if message.delivered_to.count() == message.chatroom.users.count():
+                    message.status = Message.SEEN
+                message.save()
+            except Message.DoesNotExist:
+                continue
 
     async def update_offline_messages(self):
-        messages = await self.fetch_sent_messages(self.user)
+        messages = await self.fetch_sent_or_delivered_messages(self.user)
         for message in messages:
-            updated_message = await self.update_message_status(message, Message.DELIVERED)
-            await self.send_delivered_notification(updated_message)
-            await self.send_message_to_user(updated_message)
+            if not await self.has_message_been_delivered_to_user(message, self.user):
+                await self.mark_message_as_delivered_to_user(message, self.user)
+                await self.send_message_to_user(message)
 
     async def send_message_to_user(self, message):
         await self.send(text_data=json.dumps({
@@ -147,49 +135,49 @@ class ChatConsumer(AsyncWebsocketConsumer):
         }))
 
     @database_sync_to_async
-    def fetch_sent_messages(self, user):
+    def fetch_sent_or_delivered_messages(self, user):
         return list(
             Message.objects.filter(
                 chatroom__users=user,
-                status=Message.SENT
             ).exclude(
                 sender=user
             )
         )
 
     @database_sync_to_async
-    def update_message_status(self, message, status):
-        message.status = status
+    def has_message_been_delivered_to_user(self, message, user):
+        return message.delivered_to.filter(id=user.id).exists()
+
+    @database_sync_to_async
+    def mark_message_as_delivered_to_user(self, message, user):
+        message.delivered_to.add(user)
+        if message.delivered_to.count() == message.chatroom.users.count():
+            message.status = Message.DELIVERED
         message.save()
-        return message
 
     @database_sync_to_async
     def get_sender_and_chatroom_id(self, message):
         return message.chatroom.id, message.sender.id
 
-    async def send_delivered_notification(self, message):
-        chatroom_id, sender_id = await self.get_sender_and_chatroom_id(message)
-        sender_channel_name = user_channel_map.get(message.sender.id)
+    @database_sync_to_async
+    def get_chat_room_users(self, chat_room):
+        return list(chat_room.users.all())
 
-        if sender_channel_name:
-            await self.channel_layer.send(
-                sender_channel_name,
-                {
-                    "type": "message_delivered_notification",
-                    "message_id": message.id,
-                    "status": message.status,
-                    "sender": sender_id,
-                    "timestamp": message.timestamp.isoformat(),
-                    "chat_room_id": chatroom_id,
-                },
-            )
-
-    async def message_delivered_notification(self, event):
-        await self.send(text_data=json.dumps({
-            "type": "message_delivered",
-            "message_id": event["message_id"],
-            "status": event["status"],
-            "sender": event["sender"],
-            "timestamp": event["timestamp"],
-            "chat_room_id": event["chat_room_id"],
-        }))
+    async def notify_chat_room_users(self, chat_room, message):
+        chat_room_users = await self.get_chat_room_users(chat_room)
+        for user in chat_room_users:
+            recipient_is_online = await self.is_user_online(user)
+            if not recipient_is_online:
+                continue
+            recipient_channel = user_channel_map.get(user.id)
+            if recipient_channel:
+                await self.channel_layer.send(
+                    recipient_channel,
+                    {
+                        "type": "chat_message",
+                        "message": message.content,
+                        "timestamp": message.timestamp.isoformat(),
+                        "chat_room_id": chat_room.id,
+                        "status": Message.DELIVERED,
+                    },
+                )

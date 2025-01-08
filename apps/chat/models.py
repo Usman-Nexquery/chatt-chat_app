@@ -28,6 +28,7 @@ class Message(models.Model):
         choices=STATUS_CHOICES,
         default=SENT,
     )
+    delivered_to = models.ManyToManyField(User, related_name='delivered_messages', blank=True)  # Track delivered users
 
     def __str__(self):
         return f"Message from {self.sender} at {self.timestamp} ({self.status})"
