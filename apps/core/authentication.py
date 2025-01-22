@@ -1,18 +1,12 @@
-from channels.db import database_sync_to_async
 from django.contrib.auth.backends import ModelBackend
-
 from apps.users.models import User
-
 
 class CustomAuthBackend(ModelBackend):
     """
-    Custom authentication backend.
-
-    Allows users to log in using their email address.
+    Custom authentication backend that allows users to log in using their email address.
     """
 
-    @database_sync_to_async
-    def authenticate(self, email=None, password=None, **kwargs):
+    def authenticate(self, request=None, email=None, password=None, **kwargs):
         """
         Overrides the authenticate method to allow users to log in using their email address.
         """
